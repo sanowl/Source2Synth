@@ -3,7 +3,6 @@ import aiohttp
 import async_lru
 import numpy as np
 import pandas as pd
-import sqlite3
 import random
 import logging
 import sys
@@ -11,7 +10,6 @@ import os
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from collections import defaultdict
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -53,8 +51,8 @@ class Source2SynthConfig:
     batch_size: int = 16
     num_epochs: int = 3
     seed: int = 42
-    api_key: str = field(default_factory=lambda: os.getenv("WIKIPEDIA_API_KEY", "your_api_key_here"))
-    nlp_model_name: str = "en_core_web_sm"  # Example NLP model
+    api_key: str = field(default_factory=lambda: os.getenv("WIKIPEDIA_API_KEY"))
+    nlp_model_name: str = "en_core_web_sm"
     retry_attempts: int = 3
     retry_delay: float = 1.0  # in seconds
 
@@ -63,6 +61,8 @@ class Source2SynthConfig:
         torch.manual_seed(self.seed)
         if self.device == "cuda":
             torch.cuda.manual_seed_all(self.seed)
+        if not self.api_key:
+            raise ValueError("WIKIPEDIA_API_KEY environment variable not set")
 
 # Configure logging with detailed format and multiple handlers
 def configure_logging(log_level: int = logging.INFO) -> logging.Logger:
@@ -71,6 +71,10 @@ def configure_logging(log_level: int = logging.INFO) -> logging.Logger:
     formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
     )
+
+    # Clear existing handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
 
     # Console handler
     ch = logging.StreamHandler(sys.stdout)
@@ -122,7 +126,7 @@ class DataSource(ABC):
 
 class SeedGenerator(ABC):
     @abstractmethod
-    def generate_seed(self, data: Dict[str, Any]) -> str:
+    def generate_seed(self, data: Dict[str, Any]) -> Optional[str]:
         """Generate a seed from the given data."""
         pass
 
@@ -165,7 +169,9 @@ class WikipediaDataSource(DataSource):
                 try:
                     article = await future
                     if article:
-                        articles.append(article)
+                        full_article = await self.fetch_full_article(session, article['pageid'])
+                        if full_article:
+                            articles.append(full_article)
                         if len(articles) >= dataset_size:
                             break
                 except DataSourceError as e:
@@ -207,6 +213,50 @@ class WikipediaDataSource(DataSource):
         self.logger.error("Max retry attempts reached. Failed to fetch article.")
         return None
 
+    async def fetch_full_article(self, session: aiohttp.ClientSession, pageid: int) -> Optional[Dict[str, Any]]:
+        """Fetch the full text of a Wikipedia article using its pageid."""
+        params = {
+            "action": "query",
+            "format": "json",
+            "prop": "extracts",
+            "explaintext": True,
+            "pageids": pageid,
+            "redirects": 1
+        }
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                async with session.get(self.base_url, params=params) as response:
+                    if response.status != 200:
+                        self.logger.warning(f"Non-200 response while fetching full article: {response.status}. Attempt {attempt} of {self.retry_attempts}.")
+                        await asyncio.sleep(self.retry_delay)
+                        continue
+                    data = await response.json()
+                    pages = data.get("query", {}).get("pages", {})
+                    page = pages.get(str(pageid), {})
+                    extract = page.get("extract", "")
+                    if extract:
+                        return {"text": extract, "related_texts": self.extract_related_texts(extract)}
+                    self.logger.debug("No extract found in article.")
+                    return None
+            except aiohttp.ClientError as e:
+                self.logger.warning(f"Client error while fetching full article: {e}. Attempt {attempt} of {self.retry_attempts}.")
+                await asyncio.sleep(self.retry_delay)
+            except Exception as e:
+                self.logger.error(f"Unexpected error while fetching full article: {e}. Attempt {attempt} of {self.retry_attempts}.")
+                await asyncio.sleep(self.retry_delay)
+        self.logger.error("Max retry attempts reached. Failed to fetch full article.")
+        return None
+
+    def extract_related_texts(self, text: str) -> List[str]:
+        """
+        Extract related texts from the article.
+        For simplicity, we'll extract the first few sentences as related texts.
+        This can be enhanced to extract more meaningful related texts.
+        """
+        sentences = text.split('. ')
+        related_texts = sentences[1:4] if len(sentences) >=4 else sentences[1:]
+        return related_texts
+
 class EntitySeedGenerator(SeedGenerator):
     """SeedGenerator implementation using spaCy NLP model to extract entities."""
 
@@ -214,18 +264,18 @@ class EntitySeedGenerator(SeedGenerator):
         self.nlp_model = nlp_model
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
-    def generate_seed(self, data: Dict[str, Any]) -> str:
+    def generate_seed(self, data: Dict[str, Any]) -> Optional[str]:
         """Generate a seed entity from the given data."""
         try:
             text = data.get('text', '')
             if not text:
                 self.logger.debug("Empty text provided for seed generation.")
-                return ""
+                return None
             doc = self.nlp_model(text)
             entities = [ent.text for ent in doc.ents if ent.label_ in {"PERSON", "ORG", "GPE", "EVENT"}]
             if not entities:
                 self.logger.debug("No relevant entities found in text.")
-                return ""
+                return None
             seed = random.choice(entities)
             self.logger.debug(f"Generated seed: {seed}")
             return seed
@@ -290,7 +340,7 @@ class MHQAExampleConstructor(ExampleConstructor):
                 )
             generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             self.logger.debug(f"Generated text: {generated_text}")
-            return generated_text
+            return generated_text.strip()
         except Exception as e:
             self.logger.error(f"Error generating text: {e}")
             raise ExampleConstructionError(f"Failed to generate text: {e}") from e
@@ -322,10 +372,20 @@ class MLFlowDataCurator(DataCurator):
 
     def _is_high_quality(self, example: Dict[str, Any]) -> bool:
         """Determine if an example is of high quality."""
-        # Implement actual quality checks. Placeholder logic:
-        quality = random.random() < self.config.curation_ratio
-        self.logger.debug(f"Example quality: {'High' if quality else 'Low'}")
-        return quality
+        question = example.get("question", "")
+        context = example.get("context", "")
+        seed = example.get("seed", "")
+        if not question or not context or not seed:
+            self.logger.debug("Example missing question, context, or seed.")
+            return False
+        if len(question.split()) < 5 or len(context.split()) < 50:
+            self.logger.debug("Question or context too short.")
+            return False
+        if seed not in context:
+            self.logger.debug("Seed not found in context.")
+            return False
+        self.logger.debug("Example quality: High")
+        return True
 
 # ============================================================
 # Custom PyTorch Dataset
@@ -349,14 +409,14 @@ class Source2SynthDataset(Dataset):
             question,
             context,
             add_special_tokens=True,
-            max_length=512,
+            max_length=self.tokenizer.model_max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt"
         )
         input_ids = inputs["input_ids"].squeeze()
         attention_mask = inputs["attention_mask"].squeeze()
-        labels = input_ids.clone()  # For causal LM, labels are the same as input_ids
+        labels = input_ids.clone()
 
         return {
             "input_ids": input_ids,
@@ -418,8 +478,12 @@ class Source2Synth:
             if not seed:
                 self.logger.debug("No seed generated; skipping example.")
                 continue
-            example = self.example_constructor.construct_example(data, seed)
-            dataset.append(example)
+            try:
+                example = self.example_constructor.construct_example(data, seed)
+                dataset.append(example)
+            except ExampleConstructionError as e:
+                self.logger.debug(f"Skipping example due to error: {e}")
+                continue
         self.logger.info(f"Generated {len(dataset)} examples.")
         return dataset
 
@@ -454,8 +518,8 @@ class Source2Synth:
             metric_for_best_model="loss",
             greater_is_better=False,
             seed=self.config.seed,
-            report_to=["mlflow"],  # Integrate with MLflow
-            fp16=torch.cuda.is_available(),  # Enable mixed precision if possible
+            report_to=["mlflow"],
+            fp16=torch.cuda.is_available(),
         )
 
         trainer = Trainer(
@@ -514,10 +578,9 @@ if __name__ == "__main__":
         "temperature": 0.8,
         "num_beams": 5,
         "learning_rate": 3e-5,
-        "batch_size": 32,
+        "batch_size": 8,
         "num_epochs": 5,
         "seed": 123,
-        "api_key": os.getenv("WIKIPEDIA_API_KEY", "your_actual_api_key_here"),
         "nlp_model_name": "en_core_web_sm",
         "retry_attempts": 5,
         "retry_delay": 2.0
