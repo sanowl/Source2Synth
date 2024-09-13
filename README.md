@@ -1,4 +1,4 @@
-```markdown
+
 # Source2Synth
 
 ## Table of Contents
