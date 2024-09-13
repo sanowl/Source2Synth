@@ -285,4 +285,3 @@ Please adhere to the [Code of Conduct](CODE_OF_CONDUCT.md) to ensure a welcoming
 ---
 
 *Happy Coding and Best of Luck with Your Source2Synth Pipeline! 🚀*
-```
