@@ -3,7 +3,6 @@ import aiohttp
 import async_lru
 import numpy as np
 import pandas as pd
-import random
 import logging
 import sys
 import os
@@ -27,6 +26,7 @@ from tqdm.asyncio import tqdm_asyncio
 from functools import lru_cache
 import spacy
 from dotenv import load_dotenv
+import secrets
 
 # ============================================================
 # Load Environment Variables
@@ -276,7 +276,7 @@ class EntitySeedGenerator(SeedGenerator):
             if not entities:
                 self.logger.debug("No relevant entities found in text.")
                 return None
-            seed = random.choice(entities)
+            seed = secrets.choice(entities)
             self.logger.debug(f"Generated seed: {seed}")
             return seed
         except Exception as e:
